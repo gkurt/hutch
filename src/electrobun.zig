@@ -2613,6 +2613,10 @@ fn codesignBundle(
     if (try signingBundleExecutable(ctx, bundle_root)) |executable| {
         try bundle_executables.put(executable, {});
     }
+    // The launcher starts the runtime as a child, and the runtime is the process that calls AppKit and the system's
+    // services. macOS knows a process's app by the process's code signing identifier, so the runtime takes the app's
+    // identifier: signed as `bun`, its UNUserNotificationCenter requests fail with UNErrorDomain code 1.
+    const app_identifier = try signingBundleIdentifier(ctx, bundle_root);
     for (bundles.items) |target| {
         if (try signingBundleExecutable(ctx, target.path)) |executable| {
             try bundle_executables.put(executable, {});
@@ -2632,6 +2636,7 @@ fn codesignBundle(
             target.path,
             if (target.is_macho and machOUsesEntitlements(target.relative_path)) entitlements_path else null,
             true,
+            if (isAppRuntimeExecutable(target.relative_path)) app_identifier else null,
         );
     }
     for (bundles.items) |target| {
@@ -2641,9 +2646,10 @@ fn codesignBundle(
             target.path,
             if (std.mem.endsWith(u8, target.relative_path, ".app")) entitlements_path else null,
             true,
+            null,
         );
     }
-    try codesignPath(ctx, developer_id, bundle_root, entitlements_path, true);
+    try codesignPath(ctx, developer_id, bundle_root, entitlements_path, true, null);
     try runReleaseCommand(
         ctx,
         &.{ "codesign", "--verify", "--deep", "--strict", "--verbose=2", bundle_root },
@@ -2679,6 +2685,27 @@ fn signingBundleExecutable(ctx: *const Context, bundle_root: []const u8) !?[]con
         return error.SigningBundleExecutableNotFound;
     }
     return null;
+}
+
+fn signingBundleIdentifier(ctx: *const Context, bundle_root: []const u8) !?[]const u8 {
+    const plist = try std.fs.path.join(ctx.allocator, &.{ bundle_root, "Contents/Info.plist" });
+    if (!pathExists(ctx.io, plist)) return null;
+    const result = try std.process.run(ctx.allocator, ctx.io, .{
+        .argv = &.{ "/usr/bin/plutil", "-extract", "CFBundleIdentifier", "raw", "-expect", "string", "-o", "-", plist },
+        .cwd = .{ .path = ctx.project_root },
+        .environ_map = ctx.environ_map,
+    });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    if (termExitCode(result.term) != 0) return null;
+    const identifier = std.mem.trim(u8, result.stdout, "\r\n");
+    if (identifier.len == 0) return null;
+    return try ctx.allocator.dupe(u8, identifier);
+}
+
+/// The runtime the launcher starts, which runs the app's main process.
+fn isAppRuntimeExecutable(path: []const u8) bool {
+    return std.mem.eql(u8, path, "Contents/MacOS/bun") or std.mem.eql(u8, path, "Contents/MacOS/cottontail");
 }
 
 fn isNestedCodeBundle(path: []const u8) bool {
@@ -2846,6 +2873,17 @@ test "macOS signing seals unsigned nested code before bundle principals" {
         try std.testing.expect(std.mem.indexOf(u8, entitlements, "<key>com.apple.security.cs.allow-jit</key>") != null);
         try std.testing.expect(std.mem.indexOf(u8, entitlements, "<true/>") != null);
     }
+    // The runtime the launcher starts is signed as the app, so macOS knows the runtime's process as the app's.
+    const runtime = try std.process.run(allocator, io, .{
+        .argv = &.{ "/usr/bin/codesign", "--display", "--verbose=2", try fixture.path(app ++ "/Contents/MacOS/bun") },
+        .environ_map = &environment,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, runtime.stderr, "Identifier=dev.hutch.signing.app\n") != null);
+    const sibling = try std.process.run(allocator, io, .{
+        .argv = &.{ "/usr/bin/codesign", "--display", "--verbose=2", try fixture.path(app ++ "/Contents/MacOS/zig-zstd") },
+        .environ_map = &environment,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, sibling.stderr, "Identifier=dev.hutch.signing.app\n") == null);
     // Verify that nested resources are sealed by the final outer signature.
     try fixture.write(resource_bundle ++ "/Contents/Resources/data.txt", "changed after signing\n");
     const tampered = try std.process.run(allocator, io, .{
@@ -2892,6 +2930,7 @@ fn codesignPath(
     path: []const u8,
     entitlements_path: ?[]const u8,
     hardened_runtime: bool,
+    identifier: ?[]const u8,
 ) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(ctx.allocator);
@@ -2909,6 +2948,9 @@ fn codesignPath(
     if (entitlements_path) |entitlements| {
         try argv.appendSlice(ctx.allocator, &.{ "--entitlements", entitlements });
     }
+    if (identifier) |id| {
+        try argv.appendSlice(ctx.allocator, &.{ "--identifier", id });
+    }
     try argv.append(ctx.allocator, path);
     try runReleaseCommand(ctx, argv.items, ctx.project_root, null);
 }
@@ -2922,7 +2964,7 @@ fn codesignDmg(ctx: *const Context, dmg_path: []const u8) !void {
         );
         return error.MissingDeveloperId;
     };
-    try codesignPath(ctx, developer_id, dmg_path, null, false);
+    try codesignPath(ctx, developer_id, dmg_path, null, false, null);
     try runReleaseCommand(
         ctx,
         &.{ "codesign", "--verify", "--verbose=2", dmg_path },
